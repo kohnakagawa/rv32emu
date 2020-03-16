@@ -1,3 +1,26 @@
+# NOTE
+To run Zephyr applications using rv32emu, edit `zephyr/boards/riscv/qemu_riscv32/qemu_riscv32_defconfig` as follows.
+
+```
+diff --git a/boards/riscv/qemu_riscv32/qemu_riscv32_defconfig b/boards/riscv/qemu_riscv32/qemu_riscv32_defconfig
+index f26eeb53f9..30e10b415d 100644
+--- a/boards/riscv/qemu_riscv32/qemu_riscv32_defconfig
++++ b/boards/riscv/qemu_riscv32/qemu_riscv32_defconfig
+@@ -16,3 +16,6 @@ CONFIG_RISCV_MACHINE_TIMER=y
+ CONFIG_GPIO=y
+ CONFIG_GPIO_SIFIVE=y
+ CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC=10000000
++CONFIG_XIP=y
++CONFIG_RISCV_SOC_INTERRUPT_INIT=y
++CONFIG_MULTITHREADING=n
+```
+
+Then, build Zephyr applications as follows:
+
+```
+$ west build -b qemu_riscv32 samples/hello_world/
+```
+
 # RISC-V RV32I[MA] emulator with ELF support
 
 This is a RISC-V emulator for the RV32I architecture, based on [TinyEMU](https://bellard.org/tinyemu/)

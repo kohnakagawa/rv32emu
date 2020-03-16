@@ -23,7 +23,7 @@
 // #define DEBUG_OUTPUT
 // #define DEBUG_EXTRA
 
-#define STRICT_RV32I
+// #define STRICT_RV32I
 #define FALSE (0)
 #define TRUE (-1)
 
@@ -99,8 +99,6 @@ void print_stats(uint64_t total)
         }
         if (stats[i]) {
             if (i < 63)
-                printf("%s\t= %u\n", statnames[i], stats[i]);
-            else
                 printf("[%i] = %u\n", i, stats[i]);
         }
     }
@@ -125,27 +123,56 @@ void print_stats(uint64_t total)
 #endif
 
 /* memory mapped registers */
-#define MTIME_ADDR 0x40000000
-#define MTIMECMP_ADDR 0x40000008
-#define UART_TX_ADDR 0x40002000
+// based on SiFive platform
+
+// PLIC
+#define PLIC_BASE_ADDR_0 0x0c000000
+#define PLIC_BASE_ADDR_1 0x0c001000
+#define PLIC_BASE_ADDR_2 0x0c002000
+#define PLIC_BASE_ADDR_3 0x0c200000
+
+// CLINT
+#define MSIP_ADDR  0x02000000
+#define MTIME_ADDR 0x0200bff8
+#define MTIMECMP_ADDR 0x02004000
+
+#define UART_TX_DATA_ADDR 0x10013000
+#define UART_RX_DATA_ADDR 0x10013004
+#define UART_TX_CTRL_ADDR 0x10013008
+#define UART_RX_CTRL_ADDR 0x1001300c
+#define UART_IE_ADDR 0x10013010
+#define UART_IP_ADDR 0x10013014
+
+#define IS_PLIC_ADDR(addr) (((addr) >= 0x0c000000) && ((addr) < 0x0c200008))
+#define IS_GPIO_ADDR(addr) (((addr) >= 0x10012000) && ((addr) < 0x10013000))
+#define IS_PRCI_ADDR(addr) (((addr) >= 0x10008000) && ((addr) < 0x10010000))
+#define IS_UART_ADDR(addr) (((addr) >= UART_TX_DATA_ADDR) && ((addr) < 0x10014000)) 
+
+/* emulate ROM */
+#define ROM_SIZE 0xc0000
+uint8_t rom[ROM_SIZE];
+uint32_t rom_data_start;
 
 /* emulate RAM */
 #define RAM_SIZE 0x10000
 uint8_t ram[RAM_SIZE];
+uint32_t ram_start;
+uint32_t ram_last = 0;
+uint32_t ram_curr = 0;
 
 /* special memory mapped registers */
 uint64_t mtime;
 uint64_t mtimecmp;
 
-/* virtual start address for index 0 in the ram array */
-uint32_t ram_start;
+/* virtual start address for index 0 in the rom array */
+uint32_t rom_start;
 
 /* program entry point */
 uint32_t start;
 
 /* last byte of the memory initialized and temporary value */
-uint32_t ram_last = 0;
-uint32_t ram_curr = 0;
+uint32_t rom_last = 0;
+uint32_t rom_curr = 0;
 
 /* used when called from the compliance tests */
 uint32_t begin_signature = 0;
@@ -630,15 +657,15 @@ void raise_exception(uint32_t cause, uint32_t tval)
 
     if (priv <= PRV_S) {
         /* delegate the exception to the supervisor priviledge */
-        if (cause & CAUSE_INTERRUPT)
+        if (cause & CAUSE_INTERRUPT) // 割り込みの場合
             deleg = (mideleg >> (cause & (XLEN - 1))) & 1;
-        else
+        else // 同期例外の場合
             deleg = (medeleg >> cause) & 1;
     } else {
         deleg = 0;
     }
 
-    if (deleg) {
+    if (deleg) { // 移譲が有効になっている場合は S モードに遷移
         scause = cause;
         sepc = pc;
         stval = tval;
@@ -649,15 +676,17 @@ void raise_exception(uint32_t cause, uint32_t tval)
         priv = PRV_S;
         next_pc = stvec;
     } else {
-        mcause = cause;
-        mepc = pc;
-        mtval = tval;
-        mstatus = (mstatus & ~MSTATUS_MPIE) |
-                  (((mstatus >> priv) & 1) << MSTATUS_MPIE_SHIFT);
-        mstatus = (mstatus & ~MSTATUS_MPP) | (priv << MSTATUS_MPP_SHIFT);
-        mstatus &= ~MSTATUS_MIE;
-        priv = PRV_M;
-        next_pc = mtvec;
+        mcause = cause; // 例外原因
+        mepc = pc; // 例外を発生させた命令
+        mtval = tval; // トラップ情報
+        // 現在のマシンモードでのグローバル割り込み有効化ビットをMPIEとして設定
+        mstatus = (mstatus & ~MSTATUS_MPIE) | // 現在のMPIEを0クリアし
+                  (((mstatus >> priv) & 1) << MSTATUS_MPIE_SHIFT); // 現在のグローバル割り込み有効化ビットを立てる
+        mstatus = (mstatus & ~MSTATUS_MPP) |  // 現在のMPPを0クリアし
+                  (priv << MSTATUS_MPP_SHIFT); // 現在のCPUモードをMPPに設定する
+        mstatus &= ~MSTATUS_MIE; // グローバル割り込みを無効化
+        priv = PRV_M; // Mモードに移行
+        next_pc = mtvec; // トラップベクトルに設定されたプログラムカウンターに変更
     }
 }
 
@@ -673,12 +702,14 @@ uint32_t get_pending_irq_mask()
     switch (priv) {
     case PRV_M:
         if (mstatus & MSTATUS_MIE)
+            // mideleg は M より低い特権で処理させる(移譲させる)割り込みについてのみビットが立っている
+            // ~mideleg で M で処理すべき割り込みのビットだけを選択して取り出すことができる
             enabled_ints = ~mideleg;
         break;
     case PRV_S:
         enabled_ints = ~mideleg;
-        if (mstatus & MSTATUS_SIE)
-            enabled_ints |= mideleg;
+        if (mstatus & MSTATUS_SIE) // S モードでグローバル割り込みが有効になっている場合には
+            enabled_ints |= mideleg; // 移譲された分の割り込み処理を担当
         break;
     default:
     case PRV_U:
@@ -711,10 +742,10 @@ uint32_t get_insn32(uint32_t pc)
     if (pc + 3 > maxmemr)
         maxmemr = pc + 3;
 #endif
-    uint32_t ptr = pc - ram_start;
-    if (ptr > RAM_SIZE)
+    uint32_t ptr = pc - rom_start;
+    if (ptr > ROM_SIZE)
         return 1;
-    uint8_t *p = ram + ptr;
+    uint8_t *p = rom + ptr;
     return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
 }
 
@@ -728,15 +759,37 @@ int target_read_u8(uint8_t *pval, uint32_t addr)
     if (addr > maxmemr)
         maxmemr = addr;
 #endif
-    addr -= ram_start;
-    if (addr > RAM_SIZE) {
+    if (IS_PLIC_ADDR(addr) || IS_GPIO_ADDR(addr) || IS_PRCI_ADDR(addr) || IS_UART_ADDR(addr)) {
         *pval = 0;
-        printf("illegal read 8, PC: 0x%08x, address: 0x%08x\n", pc,
-               addr + ram_start);
-        return 1;
+        return 0;
+    }
+
+    if ((addr >= rom_start) && (addr < ram_start)) {
+        addr -= rom_start;
+        if (addr > ROM_SIZE) {
+            *pval = 0;
+            printf("illegal read 8, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + rom_start);
+            return 1;
+        } else {
+            uint8_t *p = rom + addr;
+            *pval = p[0];
+        }
+    } else if (addr >= ram_start) {
+        addr -= ram_start;
+        if (addr > RAM_SIZE) {
+            *pval = 0;
+            printf("illegal read 8, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + ram_start);
+            return 1;
+        } else {
+            uint8_t *p = ram + addr;
+            *pval = p[0];
+        }
     } else {
-        uint8_t *p = ram + addr;
-        *pval = p[0];
+        *pval = 0;
+        printf("illegal read 8, PC: 0x%08x, address: 0x%08x\n", pc, addr);
+        return 1;
     }
     return 0;
 }
@@ -756,15 +809,39 @@ int target_read_u16(uint16_t *pval, uint32_t addr)
         pending_tval = addr;
         return 1;
     }
-    addr -= ram_start;
-    if (addr > RAM_SIZE) {
+
+    if (IS_PLIC_ADDR(addr) || IS_GPIO_ADDR(addr) || IS_PRCI_ADDR(addr) || IS_UART_ADDR(addr)) {
+        *pval = 0;
+        return 0;
+    }
+
+    if ((addr >= rom_start) && (addr < ram_start)) {
+        addr -= rom_start;
+        if (addr > ROM_SIZE) {
+            *pval = 0;
+            printf("illegal read 16, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + rom_start);
+            return 1;
+        } else {
+            uint8_t *p = rom + addr;
+            *pval = p[0] | (p[1] << 8);
+        }
+    } else if (addr >= ram_start) {
+        addr -= ram_start;
+        if (addr > RAM_SIZE) {
+            *pval = 0;
+            printf("illegal read 16, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + ram_start);
+            return 1;
+        } else {
+            uint8_t *p = ram + addr;
+            *pval = p[0] | (p[1] << 8);
+        }
+    } else {
         *pval = 0;
         printf("illegal read 16, PC: 0x%08x, address: 0x%08x\n", pc,
-               addr + ram_start);
+            addr);
         return 1;
-    } else {
-        uint8_t *p = ram + addr;
-        *pval = p[0] | (p[1] << 8);
     }
     return 0;
 }
@@ -779,6 +856,11 @@ int target_read_u32(uint32_t *pval, uint32_t addr)
     if (addr + 3 > maxmemr)
         maxmemr = addr + 3;
 #endif
+    if (IS_PLIC_ADDR(addr) || IS_GPIO_ADDR(addr) || IS_PRCI_ADDR(addr) || IS_UART_ADDR(addr)) {
+        *pval = 0;
+        return 0;
+    }
+
     if (addr & 3) {
         pending_exception = CAUSE_MISALIGNED_LOAD;
         pending_tval = addr;
@@ -792,17 +874,33 @@ int target_read_u32(uint32_t *pval, uint32_t addr)
         *pval = (uint32_t) mtime;
     } else if (addr == MTIME_ADDR + 4) {
         *pval = (uint32_t)(mtime >> 32);
-    } else {
+    } else if ((addr >= rom_start) && (addr < ram_start)) {
+        addr -= rom_start;
+        if (addr > ROM_SIZE) {
+            *pval = 0;
+            printf("illegal read 32, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + rom_start);
+            return 1;
+        } else {
+            uint8_t *p = rom + addr;
+            *pval = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+        }
+    } else if (addr >= ram_start) {
         addr -= ram_start;
         if (addr > RAM_SIZE) {
             *pval = 0;
             printf("illegal read 32, PC: 0x%08x, address: 0x%08x\n", pc,
-                   addr + ram_start);
+                addr + ram_start);
             return 1;
         } else {
             uint8_t *p = ram + addr;
             *pval = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
         }
+    } else {
+        *pval = 0;
+        printf("illegal read 32, PC: 0x%08x, address: 0x%08x\n", pc,
+            addr);
+        return 1;
     }
     return 0;
 }
@@ -817,10 +915,25 @@ int target_write_u8(uint32_t addr, uint8_t val)
     if (addr > maxmemw)
         maxmemw = addr;
 #endif
-    if (addr == UART_TX_ADDR) {
+    if (addr == UART_TX_DATA_ADDR) {
         /* test for UART output, compatible with QEMU */
         printf("%c", val);
-    } else {
+    }
+    if (IS_PLIC_ADDR(addr) || IS_GPIO_ADDR(addr) || IS_PRCI_ADDR(addr) || IS_UART_ADDR(addr)) {
+        return 0;
+    }
+
+    if ((addr >= rom_start) && (addr < ram_start)) {
+        addr -= rom_start;
+        if (addr > ROM_SIZE - 1) {
+            printf("illegal write 8, PC: 0x%08x, address: 0x%08x\n", pc,
+                   addr + rom_start);
+            return 1;
+        } else {
+            uint8_t *p = rom + addr;
+            p[0] = val & 0xff;
+        }
+    } else if (addr >= ram_start) {
         addr -= ram_start;
         if (addr > RAM_SIZE - 1) {
             printf("illegal write 8, PC: 0x%08x, address: 0x%08x\n", pc,
@@ -830,6 +943,10 @@ int target_write_u8(uint32_t addr, uint8_t val)
             uint8_t *p = ram + addr;
             p[0] = val & 0xff;
         }
+    } else {
+        printf("illegal write 8, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr);
+        return 1;
     }
     return 0;
 }
@@ -849,16 +966,43 @@ int target_write_u16(uint32_t addr, uint16_t val)
         pending_tval = addr;
         return 1;
     }
-    addr -= ram_start;
-    if (addr > RAM_SIZE - 2) {
-        printf("illegal write 16, PC: 0x%08x, address: 0x%08x\n", pc,
-               addr + ram_start);
-        return 1;
-    } else {
-        uint8_t *p = ram + addr;
-        p[0] = val & 0xff;
-        p[1] = (val >> 8) & 0xff;
+
+    if (addr == UART_TX_DATA_ADDR) {
+        printf("%c", val);
     }
+
+    if (IS_PLIC_ADDR(addr) || IS_GPIO_ADDR(addr) || IS_PRCI_ADDR(addr) || IS_UART_ADDR(addr)) {
+        return 0;
+    }
+
+    if ((addr >= rom_start) && (addr < ram_start)) {
+        addr -= rom_start;
+        if (addr > ROM_SIZE - 2) {
+            printf("illegal write 16, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + rom_start);
+            return 1;
+        } else { 
+            uint8_t *p = rom + addr;
+            p[0] = val & 0xff;
+            p[1] = (val >> 8) & 0xff;
+        }
+    } else if (addr >= ram_start) {
+        addr -= ram_start;
+        if (addr > RAM_SIZE - 2) {
+            printf("illegal write 16, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + ram_start);
+            return 1;
+        } else {
+            uint8_t *p = ram + addr;
+            p[0] = val & 0xff;
+            p[1] = (val >> 8) & 0xff;
+        }
+    } else {
+        printf("illegal write 16, PC: 0x%08x, address: 0x%08x\n", pc,
+            addr);
+        return 1;
+    }
+
     return 0;
 }
 
@@ -877,17 +1021,39 @@ int target_write_u32(uint32_t addr, uint32_t val)
         pending_tval = addr;
         return 1;
     }
+
+    if (addr == UART_TX_DATA_ADDR) {
+        printf("%c", val);
+    }
+
+    if (IS_PLIC_ADDR(addr) || IS_GPIO_ADDR(addr) || IS_PRCI_ADDR(addr) || IS_UART_ADDR(addr)) {
+        return 0;
+    }
+
     if (addr == MTIMECMP_ADDR) {
         mtimecmp = (mtimecmp & 0xffffffff00000000ll) | val;
         mip &= ~MIP_MTIP;
     } else if (addr == MTIMECMP_ADDR + 4) {
         mtimecmp = (mtimecmp & 0xffffffffll) | (((uint64_t) val) << 32);
         mip &= ~MIP_MTIP;
-    } else {
+    } else if ((addr >= rom_start) && (addr < ram_start)) {
+        addr -= rom_start;
+        if (addr > ROM_SIZE - 4) {
+            printf("illegal write 32, PC: 0x%08x, address: 0x%08x\n", pc,
+                addr + rom_start);
+            return 1;
+        } else {
+            uint8_t *p = rom + addr;
+            p[0] = val & 0xff;
+            p[1] = (val >> 8) & 0xff;
+            p[2] = (val >> 16) & 0xff;
+            p[3] = (val >> 24) & 0xff;
+        }
+    } else if (addr >= ram_start) {
         addr -= ram_start;
         if (addr > RAM_SIZE - 4) {
             printf("illegal write 32, PC: 0x%08x, address: 0x%08x\n", pc,
-                   addr + ram_start);
+                addr + ram_start);
             return 1;
         } else {
             uint8_t *p = ram + addr;
@@ -896,6 +1062,10 @@ int target_write_u32(uint32_t addr, uint32_t val)
             p[2] = (val >> 16) & 0xff;
             p[3] = (val >> 24) & 0xff;
         }
+    } else {
+        printf("illegal write 32, PC: 0x%08x, address: 0x%08x\n", pc,
+            addr);
+        return 1;
     }
     return 0;
 }
@@ -1112,7 +1282,7 @@ void execute_instruction()
             raise_exception(CAUSE_ILLEGAL_INSTRUCTION, insn);
             return;
         }
-        cond ^= (funct3 & 1);
+        cond ^= (funct3 & 1); // funct3 の 1 bit 目の有無で条件反転になる
         if (cond) {
             imm = ((insn >> (31 - 12)) & (1 << 12)) |
                   ((insn >> (25 - 5)) & 0x7e0) | ((insn >> (8 - 1)) & 0x1e) |
@@ -1878,18 +2048,30 @@ void riscv_cpu_interp_x32()
         next_pc = pc + 4;
 
         /* test for timer interrupt */
-        if (mtimecmp <= mtime) {
-            mip |= MIP_MTIP;
+        if (mtimecmp <= mtime) { // mip <- マシン割り込み処理まち
+            mip |= MIP_MTIP; // 割り込み発生トリガーを有効化
         }
         if ((mip & mie) != 0 && (mstatus & MSTATUS_MIE)) {
-            raise_interrupt();
+            // mie -> どの割り込みを有効化するのかを決める mip & mie することで、
+            // 有効化されている割り込みの中で割り込みの発生のトリガーが立っているもののみを表示
+            // mstatus & MSTATUS_MIE -> M mode でグローバル割り込みが有効になっているのか
+            raise_interrupt(); // 割り込みが発生
         } else {
             /* normal instruction execution */
-            insn = get_insn32(pc);
-            insn_counter++;
+            insn = get_insn32(pc); // 32bit データをフェッチするのみ
+            insn_counter++; // instruction counter をインクリメント
 
             debug_out("[%08x]=%08x, mtime: %lx, mtimecmp: %lx\n", pc, insn,
                       mtime, mtimecmp);
+            /*if (pc == 0x20401e70) {
+                printf("s0 = %x\n", reg[8]);
+                uint32_t val = 0;
+                target_read_u32(&val, 0x80000018);
+                printf("%x\n", val);
+
+                for (int i = 0; i < 100; i++)
+                    printf("%x\n", ram[i]);
+            }*/
             execute_instruction();
         }
 
@@ -1932,9 +2114,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    for (uint32_t u = 0; u < ROM_SIZE; u++)
+        rom[u] = 0;
     for (uint32_t u = 0; u < RAM_SIZE; u++)
         ram[u] = 0;
-
 
 #ifdef DEBUG_EXTRA
     init_stats();
@@ -1951,18 +2134,19 @@ int main(int argc, char **argv)
     Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
 
     /* scan for symbol table */
-    Elf_Scn *scn = NULL;
-    GElf_Shdr shdr;
-    while ((scn = elf_nextscn(elf, scn)) != NULL) {
-        gelf_getshdr(scn, &shdr);
-        if (shdr.sh_type == SHT_SYMTAB) {
+    // symbol table を検索し、エントリーポイントのアドレスを取得するなどを行う
+    Elf_Scn *scn = NULL; // descriptor for each section 
+    GElf_Shdr shdr; // section header
+    while ((scn = elf_nextscn(elf, scn)) != NULL) { // 各sectionについてスキャン
+        gelf_getshdr(scn, &shdr); // get section header
+        if (shdr.sh_type == SHT_SYMTAB) { // symbol table のみを対象
             Elf_Data *data = elf_getdata(scn, NULL);
             int count = shdr.sh_size / shdr.sh_entsize;
             for (int i = 0; i < count; i++) {
                 GElf_Sym sym;
                 gelf_getsym(data, i, &sym);
                 char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
-                if (strcmp(name, "begin_signature") == 0) {
+                if (strcmp(name, "begin_signature") == 0) { // section名を取得し、該当するアドレスを取得していく
                     begin_signature = sym.st_value;
                 }
                 if (strcmp(name, "end_signature") == 0) {
@@ -1975,17 +2159,23 @@ int main(int argc, char **argv)
                 }
 
                 /* for zephyr */
-                if (strcmp(name, "__reset") == 0) {
+                if (strcmp(name, "__start") == 0) {
                     start = sym.st_value;
                 }
                 if (strcmp(name, "__irq_wrapper") == 0) {
                     mtvec = sym.st_value;
+                }
+                if (strcmp(name, "__data_rom_start") == 0) {
+                    rom_data_start = sym.st_value;
                 }
             }
         }
     }
 
     /* set .text section as the base address */
+    // base address の値を取得
+    ram_start = 0;
+    rom_start = 0;
     scn = NULL;
     size_t shstrndx;
     elf_getshdrstrndx(elf, &shstrndx);
@@ -1995,15 +2185,21 @@ int main(int argc, char **argv)
 
         if (shdr.sh_type == SHT_PROGBITS) {
             if (strcmp(name, ".text") == 0) {
+                rom_start = shdr.sh_addr;
+            }
+            if (strcmp(name, "vector") == 0) {
+                rom_start = shdr.sh_addr;
+            }
+            if (strcmp(name, "datas") == 0) {
                 ram_start = shdr.sh_addr;
-                break;
             }
         }
+        if ((rom_start != 0) && (ram_start != 0)) break;
     }
 
     debug_out("begin_signature: 0x%08x\n", begin_signature);
     debug_out("end_signature: 0x%08x\n", end_signature);
-    debug_out("ram_start: 0x%08x\n", ram_start);
+    debug_out("rom_start: 0x%08x\n", rom_start);
     debug_out("entry point: 0x%08x\n", start);
 
     /* scan for program */
@@ -2014,9 +2210,24 @@ int main(int argc, char **argv)
         /* filter NULL address sections and .bss */
         if (shdr.sh_addr && shdr.sh_type != SHT_NOBITS) {
             Elf_Data *data = elf_getdata(scn, NULL);
-            if (shdr.sh_addr >= ram_start) {
+            if ((shdr.sh_addr >= rom_start) && (shdr.sh_addr < ram_start)) {
                 for (size_t i = 0; i < shdr.sh_size; i++) {
-                    ram_curr = shdr.sh_addr + i - ram_start;
+                    rom_curr = shdr.sh_addr + i - rom_start; // rom 配列は 0 start に設定しておく
+                    if (rom_curr >= ROM_SIZE) {
+                        debug_out(
+                            "memory pointer outside of range 0x%08x (section "
+                            "at address 0x%08x)\n",
+                            rom_curr, (uint32_t) shdr.sh_addr);
+                        /* break; */
+                    } else {
+                        rom[rom_curr] = ((uint8_t *) data->d_buf)[i];
+                        if (rom_curr > rom_last)
+                            rom_last = rom_curr;
+                    }
+                }
+            } else if (shdr.sh_addr >= ram_start) {
+                for (size_t i = 0; i < shdr.sh_size; i++) {
+                    ram_curr = shdr.sh_addr + i - ram_start; // ram 配列は 0 start に設定しておく
                     if (ram_curr >= RAM_SIZE) {
                         debug_out(
                             "memory pointer outside of range 0x%08x (section "
@@ -2036,12 +2247,19 @@ int main(int argc, char **argv)
         }
     }
 
+    printf("rom_data_start = %x\n", rom_data_start);
+
+    /* copy rom data */
+    for (uint32_t i = 0; i < ram_last; i++) {
+        rom[(rom_data_start - rom_start) + i] = ram[i];
+    }
+
     /* close ELF file */
     elf_end(elf);
     close(fd);
 
 #ifdef DEBUG_OUTPUT
-    printf("codesize: 0x%08x (%i)\n", ram_last + 1, ram_last + 1);
+    printf("codesize: 0x%08x (%i)\n", rom_last + 1, rom_last + 1);
     strcpy(hex_file, elf_file);
     po = strrchr(hex_file, '.');
     if (po != NULL)
@@ -2049,8 +2267,8 @@ int main(int argc, char **argv)
     strcat(hex_file, ".mem");
     fo = fopen(hex_file, "wt");
     if (fo != NULL) {
-        for (uint32_t u = 0; u <= ram_last; u++) {
-            fprintf(fo, "%02X ", ram[u]);
+        for (uint32_t u = 0; u <= rom_last; u++) {
+            fprintf(fo, "%02X ", rom[u]);
             if ((u & 15) == 15)
                 fprintf(fo, "\n");
         }
@@ -2061,7 +2279,7 @@ int main(int argc, char **argv)
     fo = fopen("rom.v", "wt");
     if (fo != NULL) {
         fprintf(fo, "module rom(addr,data);\n");
-        uint32_t romsz = (ram_start & 0xFFFF) + ram_last + 1;
+        uint32_t romsz = (rom_start & 0xFFFF) + rom_last + 1;
         printf("codesize with offset: %i\n", romsz);
         if (romsz >= 32768)
             fprintf(fo, "input [15:0] addr;\n");
@@ -2083,9 +2301,9 @@ int main(int argc, char **argv)
             fprintf(fo, "input [7:0] addr;\n");
         fprintf(fo,
                 "output reg [7:0] data;\nalways @(addr) begin\n case(addr)\n");
-        for (uint32_t u = 0; u <= ram_last; u++) {
-            fprintf(fo, " %i : data = 8'h%02X;\n", (ram_start & 0xFFFF) + u,
-                    ram[u]);
+        for (uint32_t u = 0; u <= rom_last; u++) {
+            fprintf(fo, " %i : data = 8'h%02X;\n", (rom_start & 0xFFFF) + u,
+                    rom[u]);
         }
         fprintf(fo,
                 " default: data = 8'h01; // invalid instruction\n "
@@ -2099,7 +2317,7 @@ int main(int argc, char **argv)
 
     /* run program in emulator */
     pc = start;
-    reg[2] = ram_start + RAM_SIZE;
+    reg[2] = rom_start + ROM_SIZE; // rom_start は base_address なので、メモリの終端に当たる
     riscv_cpu_interp_x32();
 
     uint64_t ns2 = get_clock();
@@ -2110,7 +2328,7 @@ int main(int argc, char **argv)
         int size = end_signature - begin_signature;
         for (int i = 0; i < size / 16; i++) {
             for (int j = 0; j < 16; j++) {
-                fprintf(sf, "%02x", ram[begin_signature + 15 - j - ram_start]);
+                fprintf(sf, "%02x", rom[begin_signature + 15 - j - rom_start]);
             }
             begin_signature += 16;
             fprintf(sf, "\n");
